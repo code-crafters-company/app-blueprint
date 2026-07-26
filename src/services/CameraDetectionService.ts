@@ -50,6 +50,8 @@ export interface CameraDevice {
 }
 
 export interface ScanProgress {
+  phase: 1 | 2;
+  phaseLabel: string;
   scanned: number;
   total: number;
   currentIp: string;
@@ -94,38 +96,67 @@ export class CameraDetectionService {
   }
 
   /**
-   * Testa se uma porta TCP está aberta (conexão real).
+   * Estado de uma porta TCP:
+   *  - 'open'    conectou (porta aberta) — retorna rtt via checkPort
+   *  - 'refused' conexão recusada (RST): a PORTA está fechada mas o HOST está VIVO
+   *  - 'dead'    timeout/erro de rota: host provavelmente inexistente
    */
-  private checkPort(
+  private checkPortStatus(
     host: string,
     port: number,
-    timeout = 1000
-  ): Promise<number | null> {
+    timeout: number
+  ): Promise<{ status: 'open' | 'refused' | 'dead'; rtt: number }> {
     return new Promise((resolve) => {
       const start = Date.now();
       let settled = false;
-      const finish = (open: boolean) => {
+      const finish = (status: 'open' | 'refused' | 'dead') => {
         if (settled) return;
         settled = true;
         try {
           socket.destroy();
         } catch {}
-        resolve(open ? Date.now() - start : null);
+        resolve({ status, rtt: Date.now() - start });
       };
 
-      // connectTimeout limita o tempo do connect() nativo; ele é o LIMITE real.
-      // Sem ele o módulo usa 0 = infinito, travando threads em hosts inexistentes.
+      // connectTimeout limita o connect() nativo; sem ele o módulo usa 0 =
+      // infinito, travando threads em hosts inexistentes.
       const socket = TcpSocket.createConnection(
         { host, port, connectTimeout: timeout } as any,
-        () => finish(true)
+        () => finish('open')
       );
-      socket.on('error', () => finish(false));
-      socket.on('timeout', () => finish(false));
-      // Backstop grande: NÃO deve preemptar o evento connect/error legítimo,
-      // que pode chegar atrasado pelo bridge sob carga. Só dispara se o nativo
-      // travar de vez.
-      setTimeout(() => finish(false), timeout + 4000);
+      socket.on('error', (e: any) => {
+        // "refused"/"reset" => host vivo com porta fechada; resto => morto.
+        const msg = String(e?.message || e || '');
+        finish(/refus|reset|ECONNRESET|ECONNREFUSED/i.test(msg) ? 'refused' : 'dead');
+      });
+      socket.on('timeout', () => finish('dead'));
+      // Backstop: não deve preemptar o evento legítimo (pode atrasar no bridge
+      // sob carga). Só dispara se o nativo travar de vez.
+      setTimeout(() => finish('dead'), timeout + 4000);
     });
+  }
+
+  /** Retorna rtt (ms) se a porta está aberta, senão null. */
+  private async checkPort(
+    host: string,
+    port: number,
+    timeout = 1000
+  ): Promise<number | null> {
+    const r = await this.checkPortStatus(host, port, timeout);
+    return r.status === 'open' ? r.rtt : null;
+  }
+
+  /**
+   * FASE 1: liveness. Um host está vivo se QUALQUER porta-sonda responder
+   * com conexão ou "refused" (RST). Hosts inexistentes só dão timeout => mortos.
+   */
+  private async isHostAlive(host: string, timeout = 600): Promise<boolean> {
+    const probePorts = [80, 554, 8080, 8000];
+    for (const port of probePorts) {
+      const { status } = await this.checkPortStatus(host, port, timeout);
+      if (status === 'open' || status === 'refused') return true;
+    }
+    return false;
   }
 
   /**
@@ -201,17 +232,42 @@ export class CameraDetectionService {
     };
   }
 
+  /** Executa um pool de workers sobre `items`, chamando `job(item)`. */
+  private async runPool<T>(
+    items: T[],
+    concurrency: number,
+    job: (item: T, i: number) => Promise<void>
+  ): Promise<void> {
+    let index = 0;
+    const worker = async () => {
+      while (index < items.length) {
+        const i = index++;
+        await job(items[i], i);
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, items.length || 1) }, () => worker())
+    );
+  }
+
   /**
-   * Executa a varredura real da rede local.
-   * onProgress é chamado a cada host varrido.
+   * Varredura real em 2 FASES (rápida):
+   *  Fase 1 — descoberta: acha hosts vivos varrendo poucas portas em toda a rede
+   *           (concorrência alta; hosts inexistentes caem por timeout).
+   *  Fase 2 — scan profundo: só nos hosts vivos, scan completo + fingerprint.
    */
   async scanNetwork(
     onProgress?: (p: ScanProgress) => void,
-    concurrency = 10
+    opts: { discoveryConcurrency?: number; deepConcurrency?: number } = {}
   ): Promise<CameraDevice[]> {
     if (this.scanning) return this.getDevices();
     this.scanning = true;
     this.clear();
+
+    // Pool nativo do tcp-socket = 64 threads (patch-package). Concorrência do
+    // JS alinhada para aproveitar o paralelismo real.
+    const discoveryConcurrency = opts.discoveryConcurrency ?? 48;
+    const deepConcurrency = opts.deepConcurrency ?? 16;
 
     try {
       const net = await this.getSubnet();
@@ -225,30 +281,48 @@ export class CameraDetectionService {
       const hosts: string[] = [];
       for (let i = 1; i <= 254; i++) hosts.push(`${net.subnet}.${i}`);
 
-      let scanned = 0;
+      // ---- FASE 1: descoberta de hosts vivos ----
+      const liveHosts: string[] = [];
+      let scanned1 = 0;
+      await this.runPool(hosts, discoveryConcurrency, async (ip) => {
+        const alive = await this.isHostAlive(ip);
+        scanned1++;
+        if (alive) liveHosts.push(ip);
+        onProgress?.({
+          phase: 1,
+          phaseLabel: 'Descobrindo hosts',
+          scanned: scanned1,
+          total: hosts.length,
+          currentIp: ip,
+          found: liveHosts.length,
+        });
+      });
+      console.log(`[scan] fase1 concluída: ${liveHosts.length} hosts vivos`);
+
+      // ---- FASE 2: scan profundo só nos hosts vivos ----
+      let scanned2 = 0;
       let found = 0;
-      let index = 0;
-
-      const worker = async () => {
-        while (index < hosts.length) {
-          const ip = hosts[index++];
-          const device = await this.scanHost(ip);
-          scanned++;
-          if (device) {
-            this.devices.set(ip, device);
-            found++;
-            console.log(
-              `[scan] ENCONTRADA ${ip} portas=${device.openPorts
-                .map((p) => p.port)
-                .join(',')} vendor=${device.vendor} conf=${device.confidence}`
-            );
-          }
-          onProgress?.({ scanned, total: hosts.length, currentIp: ip, found });
+      await this.runPool(liveHosts, deepConcurrency, async (ip) => {
+        const device = await this.scanHost(ip);
+        scanned2++;
+        if (device) {
+          this.devices.set(ip, device);
+          found++;
+          console.log(
+            `[scan] ENCONTRADA ${ip} portas=${device.openPorts
+              .map((p) => p.port)
+              .join(',')} vendor=${device.vendor} conf=${device.confidence}`
+          );
         }
-      };
-
-      const workers = Array.from({ length: concurrency }, () => worker());
-      await Promise.all(workers);
+        onProgress?.({
+          phase: 2,
+          phaseLabel: 'Analisando hosts vivos',
+          scanned: scanned2,
+          total: liveHosts.length || 1,
+          currentIp: ip,
+          found,
+        });
+      });
 
       return this.getDevices();
     } finally {

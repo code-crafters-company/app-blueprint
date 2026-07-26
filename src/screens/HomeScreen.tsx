@@ -111,8 +111,11 @@ export const HomeScreen: React.FC = () => {
             <View style={[styles.progressBarFill, { width: `${pct}%` }]} />
           </View>
           <Text style={styles.progressText}>
-            {progress.scanned}/{progress.total} hosts · testando {progress.currentIp} ·{' '}
-            {progress.found} encontrada(s)
+            Fase {progress.phase}/2 · {progress.phaseLabel} · {progress.scanned}/
+            {progress.total} · {progress.currentIp} ·{' '}
+            {progress.phase === 1
+              ? `${progress.found} vivo(s)`
+              : `${progress.found} câmera(s)`}
           </Text>
         </View>
       )}
