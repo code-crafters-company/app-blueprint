@@ -1,0 +1,41 @@
+{
+  "expo": {
+    "name": "Guardian Blueprint",
+    "slug": "guardian-blueprint",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#1a1a2e"
+    },
+    "updates": {
+      "fallbackToCacheTimeout": 0
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTabletMode": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "Precisamos acessar a câmera para detectar câmeras de vigilância",
+        "NSLocalNetworkUsageDescription": "Precisamos acessar a rede local para detectar câmeras IP",
+        "NSBonjourServiceTypes": [
+          "_http._tcp",
+          "_https._tcp"
+        ]
+      }
+    },
+    "android": {
+      "package": "com.guardianblueprint.app",
+      "permissions": [
+        "CAMERA",
+        "ACCESS_NETWORK_STATE",
+        "CHANGE_NETWORK_STATE",
+        "ACCESS_WIFI_STATE",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION"
+      ]
+    },
+    "web": {}
+  }
+}
